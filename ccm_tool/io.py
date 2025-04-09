@@ -125,7 +125,7 @@ def xlsx_to_nimare(coordinates_path):
     dset = nimare.dataset.Dataset(source)
     return dset
 
-def load_dense_fc(path=None, row=None):
+def load_dense_fc(src=None, row=None):
     """
     Loads HCP dense functional connectivity from local `path` or the cloud
     (if `path` is None) and returns the specified row or the entire matrix
@@ -133,8 +133,11 @@ def load_dense_fc(path=None, row=None):
 
     Parameters
     ----------
-    path: str or None
-        Path to the local .bin file. If None, the file is downloaded from the cloud
+    src: (str {path-like, 'S3'} | np.memmap | np.ndarray)
+        File or array containing the entire dense connectome
+        - 'S3': Download from the S3 bucket (slower)
+        - path-like str: Path to the local .bin file 
+        - np.memmap or np.ndarray: load from memmap or the array on memory
     row: int or None
         Row to return. If None, the entire matrix is returned
 
@@ -145,21 +148,27 @@ def load_dense_fc(path=None, row=None):
     """
     if row is not None:
         offset = row * np.dtype(DTYPE).itemsize * N_VOXELS
-    if path is None:
-        if row is None:
-            raise ValueError("Row must be specified when loading from the cloud")
-        # specify byte range
-        byte_size = np.dtype(DTYPE).itemsize * N_VOXELS
-        byte_range = f"bytes={offset}-{offset + byte_size - 1}"
-        # fetch object part
-        response = S3.get_object(Bucket=BUCKET, Key=FNAME, Range=byte_range)
-        # read binary data into an array
-        return np.frombuffer(response["Body"].read(), dtype=DTYPE)
+    if isinstance(src, str):
+        if src == 'S3':
+            if row is None:
+                raise ValueError("Row must be specified when loading from the cloud")
+            # specify byte range
+            byte_size = np.dtype(DTYPE).itemsize * N_VOXELS
+            byte_range = f"bytes={offset}-{offset + byte_size - 1}"
+            # fetch object part
+            response = S3.get_object(Bucket=BUCKET, Key=FNAME, Range=byte_range)
+            # read binary data into an array
+            return np.frombuffer(response["Body"].read(), dtype=DTYPE)
+        else:
+            if row is not None:
+                return np.fromfile(src, dtype=DTYPE, offset=offset, count=N_VOXELS)
+            else:
+                return np.fromfile(src, dtype=DTYPE).reshape(N_VOXELS, N_VOXELS)
     else:
         if row is not None:
-            return np.fromfile(path, dtype=DTYPE, offset=offset, count=N_VOXELS)
+            return src[row]
         else:
-            return np.fromfile(path, dtype=DTYPE).reshape(N_VOXELS, N_VOXELS)
+            return src
 
 def download_dense_fc(out_dir):
     """

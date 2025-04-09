@@ -20,7 +20,8 @@ mask_arr = np.isclose(mask_img.get_fdata(), 1)
 n_voxels = mask_arr.sum()
 
 def ccm(
-    dset, contrast=None, dense_fc_path=None,
+    dset, contrast=None, dense_fc_path=None, 
+    use_mmap=False, dense_fc_arr=None,
     distance_threshold=4, n_perm=1000,
     fixed_effects=False, weight_by_N=True, 
     z_from_p=True, seed=0, 
@@ -39,9 +40,17 @@ def ccm(
     dset: (nimare.dataset.Dataset)
     contrast: (str | None)
     dense_fc_path: (str | None)
-        Path to HCP dense connectome .bin file
+        Path to HCP dense connectome .bin file, which is recommended
+        to be on a scratch (fast I/O) disk
         If None, the file is downloaded from the cloud and on the fly,
         which will be slower
+    use_mmap: (bool)
+        When dense connectome is available as local file setting this
+        option will load the dense FC as a np.memmap
+    dense_fc_arr: (np.ndarray)
+        Dense FC loaded into memory. If this is provided `dense_fc_path`
+        and `use_mmap` are ignored. It'll make the process faster
+        but requires large amount of memory (80+ GB)
     distance_threshold: (float)
         in mm, if distance of a focus and its assigned grey matter mask voxel
         exceeds this threshold it will be excluded
@@ -80,7 +89,22 @@ def ccm(
     coordinates: (pd.DataFrame)
         filtered coordinates
     """
-    dset = copy.deepcopy(dset)
+    # determine source of dense connectome
+    if dense_fc_arr is not None:
+        dense_fc_src = dense_fc_arr
+        # TODO: in this case the loops summing up FCs can be vectorized
+    else:
+        if use_mmap and (dense_fc_path is not None):
+            dense_fc_src = np.memmap(
+                dense_fc_path, 
+                dtype=io.DTYPE, 
+                mode='r', 
+                shape=(io.N_VOXELS, io.N_VOXELS)
+            )
+        else:
+            dense_fc_src = dense_fc_path
+    # make a copy of the dataset
+    dset = dset.copy()
     # filter dataset to contrast
     if contrast:
         dset = dset.slice(
@@ -132,7 +156,7 @@ def ccm(
         # experiment foci
         sum_fc = np.zeros(n_voxels, dtype=float)
         for vox_idx in exp_df['vox_idx']:
-            sum_fc += io.load_dense_fc(dense_fc_path, vox_idx)
+            sum_fc += io.load_dense_fc(dense_fc_src, vox_idx)
         mean_fcs[exp_id] = sum_fc / n_points[exp_id]
         # add up this experiment's convergent connectivity
         if weight_by_N:
@@ -144,6 +168,8 @@ def ccm(
     # calculate the (weighted) mean of convergent
     # connectivity maps across included experiments
     mean_mean_fcs = sum_mean_fcs / sum_mean_fcs_denom
+    if out_path is not None:
+        np.save(os.path.join(out_path, "true_fc.npy"), mean_mean_fcs)
     # step 2: similarly calculate null convergent connectivity
     # stratified by experiemtns
     np.random.seed(seed)
@@ -155,11 +181,11 @@ def ccm(
         # number of grayordinates per experiment
         for exp_id in n_points.keys():
             rand_voxels = np.random.choice(
-                np.arange(n_voxels), size=n_points[exp_id]
+                n_voxels, size=n_points[exp_id]
             )
             sum_fc = np.zeros(n_voxels, dtype=float)
             for vox_idx in rand_voxels:
-                sum_fc += io.load_dense_fc(dense_fc_path, vox_idx)
+                sum_fc += io.load_dense_fc(dense_fc_src, vox_idx)
             null_mean_fcs[exp_id] = sum_fc / n_points[exp_id]
             if weight_by_N:
                 null_sum_mean_fcs += sample_sizes.loc[exp_id] * null_mean_fcs[exp_id]
