@@ -20,17 +20,21 @@ DTYPE=np.float16
 N_VOXELS=211590
 
 
-def jale_to_nimare(coordinates_path):
+def xlsx_to_nimare(coordinates_path):
     """
-    Converts a JALE-formatted coordinates excel file to a NiMARE dataset.
-    The excel file must have a single sheet and contain the following columns
-    (case-insensitive): 
-    - "experiments": study name
-    - "subjects": number of subjects (in the smallest group)
+    Converts a JALE/pyALE-formatted coordinates excel file to a NiMARE dataset.
+    The excel file must have a single sheet with each row representing a single
+    peak coordinate (focus) and contain the following columns (case-insensitive):
+    - "study" or "experiment" or "experiments" or "article": study name
+    - "subjects" or "N": number of subjects (in the smallest group)
     - "x", "y", "z": peak coordinates
-    - "space": coordinate space ("MNI" or "TAL")
+    - "space": coordinate space ("MNI" or "TAL").
+        Note that TAL coordinates will be converted to MNI
     - (optional) "contrast": contrast name
-    Note that other columns (e.g. tags) will be ignored.
+    Note that other columns (e.g. tags) will be added as metadata.
+    For these columns only the data of the first row of the
+    study-contrast is used, assuming that tags are information
+    related to study/contrast rather than individual foci.
 
     Parameters
     ----------
@@ -44,13 +48,42 @@ def jale_to_nimare(coordinates_path):
     """
     # load the coordinates file
     coordinates = pd.read_excel(coordinates_path)
-    # make all column names lower case
+    # standardize column names (lower case + handle study alternatives
     coordinates.columns = coordinates.columns.str.lower()
-    # TODO: add support for tags
+    coordinates = coordinates.rename(columns={
+        'experiment': 'study',
+        'experiments': 'study',
+        'article': 'study',
+        'N': 'subjects'
+    })
+    # make sure all required columns are included
+    assert set([
+        'study', 'x', 'y', 'z', 'space', 'subjects',
+    ]).issubset(set(coordinates.columns)), \
+        "Columns 'study', 'x', 'y', 'z', 'space', and"\
+        " 'subjects' (case insensitive) must exist"\
+        " in the spreadsheet"
+    # list of extra tags which will be included
+    # in metadata
+    tags = list(set(coordinates.columns) - set([
+        'study', 'x', 'y', 'z', 'space', 'subjects', 'contrast'
+    ]))
+    # remove non-standard spaces and print warning
+    nonstandard_foci = coordinates.loc[~(
+        coordinates['space'].str.lower().str.startswith('mni') |
+        coordinates['space'].str.lower().str.startswith('tal')
+    )]
+    if nonstandard_foci.shape[0] > 0:
+        print(
+            "Warning: Space includes entries with non-standard spaces that"
+            " do not start with 'mni' or 'tal' (case-insensitive). These"
+            " foci are ignored: "
+        )
+        print(nonstandard_foci)
     # drop empty rows
-    coordinates = coordinates.dropna(subset=["experiments"])
+    coordinates = coordinates.dropna(subset=["study"])
     source = {}
-    for study_id, study_df in coordinates.copy().groupby("experiments"):
+    for study_id, study_df in coordinates.copy().groupby("study"):
         if study_id not in source:
             source[study_id] = {"contrasts":{}}
         if "contrast" in study_df.columns:
@@ -64,10 +97,21 @@ def jale_to_nimare(coordinates_path):
             # to allow the individual coordinates of the contrast to be in different spaces
             # (as it may happen with coordinates reported in separate publications)
             if (exp_df["space"].str.lower().str.startswith('tal')).sum() > 0:
-                exp_df.loc[exp_df["space"].str.lower().str.startswith('tal'), ["x", "y", "z"]] = (
-                    nimare.utils.tal2mni(exp_df[["x", "y", "z"]].values)
+                tal_mask = exp_df["space"].str.lower().str.startswith('tal')
+                exp_df.loc[tal_mask, ["x", "y", "z"]] = (
+                    nimare.utils.tal2mni(exp_df.loc[tal_mask, ["x", "y", "z"]].values)
                 )
-            # TODO: also handle unknown spaces
+            metadata = {
+                "sample_sizes": [int(exp_df['subjects'].values[0])],
+            }
+            for tag in tags:
+                if len(exp_df[tag].unique()) > 1:
+                    print(
+                        f"Warning: {tag} in {study_id} ({exp_id}) "\
+                        "includes multiple values but only the value "\
+                        "of first row will be used"
+                    )
+                metadata[tag] = exp_df[tag].values[0]
             source[study_id]["contrasts"][exp_id] = {
                 "coords": {
                     "space": "MNI",
@@ -75,10 +119,7 @@ def jale_to_nimare(coordinates_path):
                     "y": exp_df['y'].tolist(),
                     "z": exp_df['z'].tolist(),
                 },
-                "metadata": {
-                    "sample_sizes": [int(exp_df['subjects'].values[0])],
-                    # TODO: add additional tags as metadata
-                }
+                "metadata": metadata
             }
     # create the nimare dataset
     dset = nimare.dataset.Dataset(source)
