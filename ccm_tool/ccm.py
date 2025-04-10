@@ -1,6 +1,7 @@
 import numpy as np
 import nibabel
 import nimare
+import nilearn.maskers
 import os
 import sys
 from scipy.spatial.distance import cdist
@@ -16,6 +17,7 @@ else:
 from ccm_tool import io
 MASK_PATH = files("ccm_tool.data.maps").joinpath("Grey10.nii.gz").as_posix()
 mask_img = nibabel.load(MASK_PATH)
+masker = nilearn.maskers.NiftiMasker(mask_img=mask_img).fit()
 mask_arr = np.isclose(mask_img.get_fdata(), 1)
 n_voxels = mask_arr.sum()
 
@@ -23,8 +25,7 @@ def ccm(
     dset, contrast=None, dense_fc_path=None, 
     use_mmap=False, dense_fc_arr=None,
     distance_threshold=4, n_perm=1000,
-    fixed_effects=False, weight_by_N=True, 
-    z_from_p=True, seed=0, 
+    fixed_effects=False, weight_by_N=True, seed=0, 
     out_path=None, save_null=True, override=False,
     verbose=False 
 ):
@@ -64,9 +65,6 @@ def ccm(
         in a single step across all foci of all experiments.        
     weight_by_N: (bool)
         weight experiments by their sample sizes
-    z_from_p: (bool)
-        calculate z from non-parametric p-values
-        rather than `(obs - mean(null)) / std(null)`
     seed: (int)
     out_path: (str | None)
         path to save the results
@@ -80,6 +78,8 @@ def ccm(
     -------
     zmap: (np.ndarray)
         z-score map. Shape: (n_voxels,)
+    pmap: (np.ndarray)
+        p-value map. Shape: (n_voxels,)
     mean_mean_fcs: (np.ndarray)
         mean of observed convergent connectivity.
         Shape: (n_voxels,)
@@ -170,6 +170,10 @@ def ccm(
     mean_mean_fcs = sum_mean_fcs / sum_mean_fcs_denom
     if out_path is not None:
         np.save(os.path.join(out_path, "true_fc.npy"), mean_mean_fcs)
+        # save as nii.gz
+        masker.inverse_transform(mean_mean_fcs).to_filename(
+            os.path.join(out_path, "true_fc.nii.gz")
+        )
     # step 2: similarly calculate null convergent connectivity
     # stratified by experiemtns
     np.random.seed(seed)
@@ -196,23 +200,38 @@ def ccm(
         mean_fc_null[perm_idx] = null_sum_mean_fcs / sum_mean_fcs_denom
     if save_null and (out_path is not None):
         np.save(os.path.join(out_path, "null_fcs.npy"), mean_fc_null)
-    # step 3: calculate z-scores
-    if z_from_p:
-        zmap_name = "zmap"
-        # calculate asymmetric one-tailed p-values
-        p_right = ((mean_fc_null >= mean_mean_fcs).sum(axis=0) + 1) / (n_perm + 1)
-        p_left = ((-mean_fc_null >= -mean_mean_fcs).sum(axis=0) + 1) / (n_perm + 1)
-        # calculate two-tailed p-values
-        p = np.minimum(p_right, p_left) * 2
-        # convert z to p
-        zmap = nimare.transforms.p_to_z(p, tail="two")
-        # make z of voxels with more extreme values
-        # towards left tail negative
-        zmap[p_left < p_right] *= -1
-    else:
-        zmap_name = "zmap_from_std"
-        diff_map = mean_mean_fcs - mean_fc_null.mean(axis=0)
-        zmap = diff_map / mean_fc_null.std(axis=0)
-    if out_path is not None:
-        np.save(os.path.join(out_path, f"{zmap_name}.npy"), zmap)
-    return zmap, mean_mean_fcs, mean_fc_null, coordinates
+    # step 3: calculate z-scores and p-values
+    zmaps = {}
+    pmaps = {}
+    for zmap_name in ["zmap_from_p", "zmap_from_std"]:
+        if zmap_name == "zmap_from_p":
+            pmap_name = "pmap_exact"
+            # calculate p-values
+            pmap = ((np.abs(mean_fc_null) >= np.abs(mean_mean_fcs)).sum(axis=0) + 1) / (n_perm + 1)
+            # convert z to p
+            zmap = nimare.transforms.p_to_z(pmap, tail="two")
+            # determine z sign based on whether observed is lower or
+            # higher than null mean
+            z_neg = (mean_mean_fcs < mean_fc_null.mean(axis=0))
+            zmap[z_neg] *= -1
+            zmaps[zmap_name] = zmap
+            pmaps[pmap_name] = pmap
+        else:
+            pmap_name = "pmap_from_std"
+            diff_map = mean_mean_fcs - mean_fc_null.mean(axis=0)
+            zmap = diff_map / mean_fc_null.std(axis=0)
+            # convert z to p
+            pmap = nimare.transforms.z_to_p(zmap, tail="two")
+            zmaps[zmap_name] = zmap
+            pmaps[pmap_name] = pmap
+        # save zmap and pmap
+        if out_path is not None:
+            np.save(os.path.join(out_path, f"{zmap_name}.npy"), zmap)
+            masker.inverse_transform(zmap).to_filename(
+                os.path.join(out_path, f"{zmap_name}.nii.gz")
+            )
+            np.save(os.path.join(out_path, f"{pmap_name}.npy"), pmap)
+            masker.inverse_transform(pmap).to_filename(
+                os.path.join(out_path, f"{pmap_name}.nii.gz")
+            )
+    return zmaps, pmaps, mean_mean_fcs, mean_fc_null, coordinates
