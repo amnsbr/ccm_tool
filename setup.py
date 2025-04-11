@@ -17,6 +17,8 @@ setup(
         'NiMARE',
         'nilearn',
         'boto3',
-        'tqdm'
+        'tqdm',
+        'seaborn',
+        'statsmodels',
     ],
 )

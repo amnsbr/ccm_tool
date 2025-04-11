@@ -1,11 +1,23 @@
 import os
+import sys
+import types
 import numpy as np
 import pandas as pd
+from matplotlib.colors import LinearSegmentedColormap
 import nimare
+import nibabel
+import nilearn.maskers
+import nilearn.datasets
 from tqdm import tqdm
 import boto3
 from botocore import UNSIGNED
 from botocore.client import Config
+
+if sys.version_info >= (3, 10):
+    from importlib.resources import files
+else:
+    from importlib_resources import files
+
 
 # prepare the S3 client for accessing the HCP dense functional connectivity data
 S3 = boto3.client(
@@ -19,6 +31,12 @@ FNAME = "subs-100_space-MNI152_den-2mm_mask-Gray10_smooth-4_desc-FC_mean_sym.bin
 DTYPE=np.float16
 N_VOXELS=211590
 
+MASK_PATH = files("ccm_tool.data.maps").joinpath("Grey10.nii.gz").as_posix()
+MASK_IMG = nibabel.load(MASK_PATH)
+MASKER = nilearn.maskers.NiftiMasker(mask_img=MASK_IMG).fit()
+MASK_ARR = np.isclose(MASK_IMG.get_fdata(), 1)
+assert np.sum(MASK_ARR) == N_VOXELS, \
+    f"Mask has {np.sum(MASK_ARR)} voxels, but expected {N_VOXELS} voxels"
 
 def xlsx_to_nimare(coordinates_path):
     """
@@ -68,6 +86,8 @@ def xlsx_to_nimare(coordinates_path):
     tags = list(set(coordinates.columns) - set([
         'study', 'x', 'y', 'z', 'space', 'subjects', 'contrast'
     ]))
+    # drop empty rows
+    coordinates = coordinates.dropna(subset=["study"])
     # remove non-standard spaces and print warning
     nonstandard_foci = coordinates.loc[~(
         coordinates['space'].str.lower().str.startswith('mni') |
@@ -80,8 +100,7 @@ def xlsx_to_nimare(coordinates_path):
             " foci are ignored: "
         )
         print(nonstandard_foci)
-    # drop empty rows
-    coordinates = coordinates.dropna(subset=["study"])
+    # create the source dictionary for nimare dataset
     source = {}
     for study_id, study_df in coordinates.copy().groupby("study"):
         if study_id not in source:
@@ -200,3 +219,64 @@ def download_dense_fc(out_dir):
             f.write(chunk)
             pbar.update(len(chunk))
     print(f"Download completed: {local_path}")
+
+
+def load_yeo_map():
+    """
+    Loads 7 resting state networks map of Yeo et al. 2011
+
+    Returns
+    -------
+    yeo_map: a name space with the following attributes
+        - cifti: cifti map
+        - categorical: map as categorical pandas Series
+        - names
+        - shortnames
+        - colors
+        - cmap
+    """
+    # load yeo atlas and resample it to mask
+    yeo_atlas = nilearn.datasets.fetch_atlas_yeo_2011(verbose=0)
+    yeo_nifti = nilearn.image.resample_to_img(
+        yeo_atlas['thick_7'], MASK_IMG, 
+        interpolation='nearest', 
+        copy_header=True, 
+        force_resample=True
+    )
+    # convert voxels within mask to a categorical series
+    yeo_categorical = pd.Series(MASKER.transform(yeo_nifti).flatten().astype("int")).astype("category")
+    # name categories
+    yeo_names = [
+        "Visual",
+        "Somatomotor",
+        "Dorsal attention",
+        "Ventral attention",
+        "Limbic",
+        "Frontoparietal",
+        "Default",
+    ]
+    yeo_categorical = yeo_categorical.cat.rename_categories(["None"] + yeo_names)
+    # set the voxels outside networks to NaN and drop the None category
+    yeo_categorical[yeo_categorical == "None"] = np.NaN
+    yeo_categorical = yeo_categorical.cat.remove_unused_categories()
+    # short names
+    yeo_shortnames = ["VIS", "SMN", "DAN", "SAN", "LIM", "FPN", "DMN"]
+    # colormap
+    yeo_colors = [
+        (0.470588, 0.0705882, 0.52549),
+        (0.27451, 0.509804, 0.705882),
+        (0.0, 0.462745, 0.054902),
+        (0.768627, 0.227451, 0.980392),
+        (0.862745, 0.972549, 0.643137),
+        (0.901961, 0.580392, 0.133333),
+        (0.803922, 0.243137, 0.305882),
+    ]
+    yeo_cmap = LinearSegmentedColormap.from_list("yeo", yeo_colors, 7)
+    return types.SimpleNamespace(
+        nifti=yeo_nifti,
+        categorical=yeo_categorical,
+        names=yeo_names,
+        shortnames=yeo_shortnames,
+        colors=yeo_colors,
+        cmap=yeo_cmap,
+    )
