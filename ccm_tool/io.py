@@ -256,8 +256,8 @@ def load_yeo_map():
         "Default",
     ]
     yeo_categorical = yeo_categorical.cat.rename_categories(["None"] + yeo_names)
-    # set the voxels outside networks to NaN and drop the None category
-    yeo_categorical[yeo_categorical == "None"] = np.NaN
+    # set the voxels outside networks to nan and drop the None category
+    yeo_categorical[yeo_categorical == "None"] = np.nan
     yeo_categorical = yeo_categorical.cat.remove_unused_categories()
     # short names
     yeo_shortnames = ["VIS", "SMN", "DAN", "SAN", "LIM", "FPN", "DMN"]

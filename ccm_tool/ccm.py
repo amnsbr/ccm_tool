@@ -80,9 +80,11 @@ def ccm(
     """
     # determine source of dense connectome
     if dense_fc_arr is not None:
+        from_memory = True
         dense_fc_src = dense_fc_arr
         # TODO: in this case the loops summing up FCs can be vectorized
     else:
+        from_memory = False
         if use_mmap and (dense_fc_path is not None):
             dense_fc_src = np.memmap(
                 dense_fc_path, 
@@ -144,9 +146,12 @@ def ccm(
         # calculate average dense RSFC of current
         # experiment foci
         sum_fc = np.zeros(io.N_VOXELS, dtype=float)
-        for vox_idx in exp_df['vox_idx']:
-            sum_fc += io.load_dense_fc(dense_fc_src, vox_idx)
-        mean_fcs[exp_id] = sum_fc / n_points[exp_id]
+        if (from_memory or use_mmap):
+            mean_fcs[exp_id] = dense_fc_src[exp_df['vox_idx'], :].mean(axis=0)
+        else:
+            for vox_idx in exp_df['vox_idx']:
+                sum_fc += io.load_dense_fc(dense_fc_src, vox_idx)
+            mean_fcs[exp_id] = sum_fc / n_points[exp_id]
         # add up this experiment's convergent connectivity
         if weight_by_N:
             sum_mean_fcs += sample_sizes.loc[exp_id] * mean_fcs[exp_id]
@@ -166,7 +171,7 @@ def ccm(
     # step 2: similarly calculate null convergent connectivity
     # stratified by experiemtns
     np.random.seed(seed)
-    mean_fc_null = np.full((n_perm, io.N_VOXELS), np.NaN)
+    mean_fc_null = np.full((n_perm, io.N_VOXELS), np.nan)
     for perm_idx in tqdm(range(n_perm)):
         null_mean_fcs = {}
         null_sum_mean_fcs = np.zeros(io.N_VOXELS, dtype=float)
@@ -177,9 +182,12 @@ def ccm(
                 io.N_VOXELS, size=n_points[exp_id]
             )
             sum_fc = np.zeros(io.N_VOXELS, dtype=float)
-            for vox_idx in rand_voxels:
-                sum_fc += io.load_dense_fc(dense_fc_src, vox_idx)
-            null_mean_fcs[exp_id] = sum_fc / n_points[exp_id]
+            if (from_memory or use_mmap):
+                null_mean_fcs[exp_id] = dense_fc_src[rand_voxels, :].mean(axis=0)
+            else:
+                for vox_idx in rand_voxels:
+                    sum_fc += io.load_dense_fc(dense_fc_src, vox_idx)
+                null_mean_fcs[exp_id] = sum_fc / n_points[exp_id]
             if weight_by_N:
                 null_sum_mean_fcs += sample_sizes.loc[exp_id] * null_mean_fcs[exp_id]
             else:
