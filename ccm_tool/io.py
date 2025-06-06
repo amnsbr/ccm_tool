@@ -26,7 +26,7 @@ S3 = boto3.client(
     config=Config(signature_version=UNSIGNED)
 )
 BUCKET = "hcp-dense-fc"
-FNAME = "subs-100_space-MNI152_den-2mm_mask-Gray10_smooth-4_desc-FC_mean_sym.bin"
+FNAME = "subs-100_space-MNI152_den-2mm_mask-Gray10_smooth-6_lp-0_08_hp-0_01_detrend_desc-FC_mean_sym.bin"
 # the datatype and number of voxels in the dense functional connectivity matrix
 DTYPE=np.float16
 N_VOXELS=211590
