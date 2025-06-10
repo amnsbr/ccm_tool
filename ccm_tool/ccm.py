@@ -203,13 +203,17 @@ def ccm(
     for zmap_name in ["zmap_from_p", "zmap_from_std"]:
         if zmap_name == "zmap_from_p":
             pmap_name = "pmap_exact"
-            # calculate p-values
-            pmap = ((np.abs(mean_fc_null) >= np.abs(mean_mean_fcs)).sum(axis=0) + 1) / (n_perm + 1)
+            # calculate asymmetric one-tailed p-values
+            p_upper = ((mean_fc_null >= mean_mean_fcs).sum(axis=0) + 1) / (n_perm + 1)
+            p_lower = ((-mean_fc_null >= -mean_mean_fcs).sum(axis=0) + 1) / (n_perm + 1)
+            # calculate two-tailed p-values
+            # cap p-values at 1.0
+            pmap = np.minimum(np.minimum(p_upper, p_lower) * 2, 1.0)
             # convert z to p
             zmap = nimare.transforms.p_to_z(pmap, tail="two")
-            # determine z sign based on whether observed is lower or
-            # higher than null mean
-            z_neg = (mean_mean_fcs < mean_fc_null.mean(axis=0))
+            # specify negative z voxels (with more extreme values
+            # towards left tail)
+            z_neg = p_lower < p_upper
             zmap[z_neg] *= -1
             zmaps[zmap_name] = zmap
             pmaps[pmap_name] = pmap
@@ -233,7 +237,7 @@ def ccm(
             )
     return zmaps, pmaps, mean_mean_fcs, mean_fc_null, coordinates
 
-def ccm_yeo(true_fc, null_fcs, z_from_p=True, fdr=True, plot='bar', ax=None):
+def ccm_yeo(true_fc, null_fcs, z_from_p=False, fdr=True, plot='bar', ax=None):
     """
     Convergent connectivity mapping resolved across seven
     resting state networks of Yeo et al. 2011
@@ -299,12 +303,19 @@ def ccm_yeo(true_fc, null_fcs, z_from_p=True, fdr=True, plot='bar', ax=None):
     # calculate z- and p-values per network
     if z_from_p:
         n_perm = null_fcs.shape[0]
-        p_vals = (
-            (np.abs(null_fcs_yeo.values) > np.abs(true_fc_yeo.values)).sum(axis=1) + 1
+        # calculate asymmetric one-tailed p-values
+        p_upper = (
+            (null_fcs_yeo.values >= true_fc_yeo.values).sum(axis=1) + 1
         ) / (n_perm + 1)
-        # convert p to z + assign z signs based on difference of observed vs mean of null
+        p_lower = (
+            (-null_fcs_yeo.values >= -true_fc_yeo.values).sum(axis=1) + 1
+        ) / (n_perm + 1)
+        # calculate two-tailed p-values
+        # cap p-values at 1.0
+        p_vals = np.minimum(np.minimum(p_upper, p_lower) * 2, 1.0)
+        # convert p to z + assign z signs based on which one-tailed p is smaller
         z_vals = nimare.transforms.p_to_z(p_vals, tail="two")
-        z_vals[null_fcs_yeo.values.mean(axis=1)>true_fc_yeo.values.flatten()] *= -1
+        z_vals[p_lower < p_upper] *= -1
     else:
         z_vals = (true_fc_yeo.iloc[:,0] - null_fcs_yeo.mean(axis=1)) / null_fcs_yeo.std(axis=1)
         p_vals = nimare.transforms.z_to_p(z_vals, tail="two")
