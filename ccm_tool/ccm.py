@@ -2,13 +2,22 @@ import os
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
+import scipy.ndimage
 import statsmodels.stats.multitest
 import matplotlib.pyplot as plt
 import seaborn as sns
 import nimare
+import nilearn.mass_univariate
 from tqdm import tqdm
 
-from ccm_tool import io
+try:
+    import cupy as cp
+    has_cupy = True
+except ImportError:
+    cp = None
+    has_cupy = False
+
+from ccm_tool import io, utils
 
 def ccm(
     dset, contrast=None, dense_fc_path=None, 
@@ -78,6 +87,12 @@ def ccm(
     coordinates: (pd.DataFrame)
         filtered coordinates
     """
+    # +1 number of permutations to use for calculating
+    # the null distribution of Z-scores when doing
+    # cluster-based corrections
+    # _n_perm will be used to calculate true z and p maps
+    _n_perm = n_perm
+    n_perm += 1
     # determine source of dense connectome
     if dense_fc_arr is not None:
         from_memory = True
@@ -204,8 +219,8 @@ def ccm(
         if zmap_name == "zmap_from_p":
             pmap_name = "pmap_exact"
             # calculate asymmetric one-tailed p-values
-            p_upper = ((mean_fc_null >= mean_mean_fcs).sum(axis=0) + 1) / (n_perm + 1)
-            p_lower = ((-mean_fc_null >= -mean_mean_fcs).sum(axis=0) + 1) / (n_perm + 1)
+            p_upper = ((mean_fc_null[:_n_perm] >= mean_mean_fcs).sum(axis=0) + 1) / (_n_perm + 1)
+            p_lower = ((-mean_fc_null[:_n_perm] >= -mean_mean_fcs).sum(axis=0) + 1) / (_n_perm + 1)
             # calculate two-tailed p-values
             # cap p-values at 1.0
             pmap = np.minimum(np.minimum(p_upper, p_lower) * 2, 1.0)
@@ -219,8 +234,8 @@ def ccm(
             pmaps[pmap_name] = pmap
         else:
             pmap_name = "pmap_from_std"
-            diff_map = mean_mean_fcs - mean_fc_null.mean(axis=0)
-            zmap = diff_map / mean_fc_null.std(axis=0)
+            diff_map = mean_mean_fcs - mean_fc_null[:_n_perm].mean(axis=0)
+            zmap = diff_map / mean_fc_null[:_n_perm].std(axis=0)
             # convert z to p
             pmap = nimare.transforms.z_to_p(zmap, tail="two")
             zmaps[zmap_name] = zmap
@@ -237,6 +252,104 @@ def ccm(
             )
     return zmaps, pmaps, mean_mean_fcs, mean_fc_null, coordinates
 
+def corr_tfce(true_fc, null_fcs, gpu=False):
+    """
+    TFCE correction of convergent connectivity mapping
+
+    Parameters
+    ----------
+    true_fc: (np.ndarray)
+        true (observed) convergent FC in MNI masked voxels.
+        Shape (n_voxels,)
+    null_fcs: (np.ndarray)
+        null FCs in MNI masked voxels.
+        Shape (_n_perm, n_voxels)
+    gpu: (bool)
+        use GPU for the calculations
+
+    Returns
+    -------
+    tfce_pvals: (np.ndarray)
+        p-values of TFCE correction.
+        Shape (x, y, z)
+    true_z: (np.ndarray)
+        true (observed) Z map.
+        Shape (x, y, z)
+    true_tfce: (np.ndarray)
+        true (observed) TFCE map.
+        Shape (x, y, z)
+    null_max_tfce: (np.ndarray)
+        null distribution of maximum absolute TFCE values.
+        Shape (n_perm,)
+    """
+    print("Running TFCE correction...")
+    # determine total number of permutations
+    # calculated, and number of permutations used
+    # for voxel-wise Z calculation
+    _n_perm = null_fcs.shape[0]
+    n_perm = _n_perm - 1
+    # define connectivity for cluster detection
+    conn = scipy.ndimage.generate_binary_structure(3, 1)
+    if gpu:
+        conn = cp.asarray(conn)
+    # get mask index mapping for faster 1D->3D mapping
+    mask_idx_mapping = utils.get_mask_idx_mapping(io.MASK_ARR)
+    if gpu:
+        mask_idx_mapping = cp.asarray(mask_idx_mapping)
+    # calculate true (observed) Z map
+    # excluding the last (extra) null FC (to have the same number of
+    # permutations when calculating null Z maps)
+    true_z = (true_fc - null_fcs[:n_perm].mean(axis=0)) / (null_fcs[:n_perm].std(axis=0)) 
+    # calculate TFCE for the true Z map after mapping it to 4D
+    if gpu:
+        # TODO: avoid repeating
+        # the code for CPU and GPU
+        true_z_4d = cp.append(true_z, 0)[mask_idx_mapping][:, :, :, None]
+        true_tfce = utils.calculate_tfce_gpu(true_z_4d, conn, two_sided_test=True).get().squeeze()
+    else:
+        true_z_4d = np.append(true_z, 0)[mask_idx_mapping][:, :, :, None]
+        true_tfce = nilearn.mass_univariate._utils.calculate_tfce(
+            true_z_4d, conn, two_sided_test=True
+        ).squeeze()
+    # calculate null Z and TFCEs to calculate 
+    # the null distribution of max values
+    # TODO: add options to keep null Zs and TFCEs
+    null_max_tfce = []
+    for perm_idx in tqdm(range(n_perm)):
+        # create a mask of current nulls which
+        # will be compared to the current permutation
+        # null (as if it is the true FC)
+        # it includes all nulls except the current one
+        if gpu:
+            mask = cp.ones(_n_perm, dtype=bool)
+        else:
+            mask = np.ones(_n_perm, dtype=bool)
+        mask[perm_idx] = False
+        # calculate null Z map
+        null_z = (null_fcs[perm_idx] - null_fcs[mask].mean(axis=0)) / (null_fcs[mask].std(axis=0))
+        # map null Z to 4D and calculate TFCE
+        # then append the maximum absolute TFCE value
+        # to the null distribution
+        if gpu:
+            null_z_4d = cp.append(null_z, 0)[mask_idx_mapping][:, :, :, None]
+            null_tfce = utils.calculate_tfce_gpu(null_z_4d, conn, two_sided_test=True)
+            null_max_tfce.append(cp.nanmax(cp.abs(null_tfce)).get())
+        else:
+            null_z_4d = np.append(null_z, 0)[mask_idx_mapping][:, :, :, None]
+            null_tfce = nilearn.mass_univariate._utils.calculate_tfce(
+                null_z_4d, conn, two_sided_test=True
+            )
+            null_max_tfce.append(np.nanmax(np.abs(null_tfce)))
+    # convert null max TFCE to array
+    null_max_tfce = np.array(null_max_tfce)
+    # calculate p-TFCE (on flattened map of true TFCE, 
+    # then reshape it to the original shape)
+    tfce_pvals = (
+        ((null_max_tfce >= np.abs(true_tfce).flatten()[:, None]).sum(axis=1) + 1)
+        / (n_perm + 1)
+    ).reshape(true_tfce.shape)
+    return tfce_pvals, true_z_4d[..., 0], true_tfce, null_max_tfce
+
 def ccm_yeo(true_fc, null_fcs, z_from_p=False, fdr=True, plot='bar', ax=None):
     """
     Convergent connectivity mapping resolved across seven
@@ -246,11 +359,11 @@ def ccm_yeo(true_fc, null_fcs, z_from_p=False, fdr=True, plot='bar', ax=None):
     Parameters
     ----------
     true_fc: (np.ndarray)
-        true (observed) convergent FC in Cifti space.
-        Shape (91282,)
+        true (observed) convergent FC in MNI masked voxels.
+        Shape (n_voxels,)
     null_fcs: (np.ndarray)
-        null FCs in Cifti space.
-        Shape (n_perm, 91282)
+        null FCs in MNI masked voxels.
+        Shape (n_perm, n_voxels)
     z_from_p: (bool)
         Calculate network-level Z-values from p-values.
         Otherwise calculates Z-values based on difference
