@@ -16,8 +16,12 @@ try:
 except ImportError:
     cp = None
     has_cupy = False
+else:
+    import nimare_gpu
 
 from ccm_tool import io, utils
+
+# TODO: use consistent docstring style
 
 def ccm(
     dset, contrast=None, dense_fc_path=None, 
@@ -258,36 +262,49 @@ def corr_tfce(true_fc, null_fcs, gpu=False):
 
     Parameters
     ----------
-    true_fc: (np.ndarray)
+    true_fc: :obj:`np.ndarray` or :obj:`cupy.ndarray`
         true (observed) convergent FC in MNI masked voxels.
         Shape (n_voxels,)
-    null_fcs: (np.ndarray)
+    null_fcs: :obj:`np.ndarray` or :obj:`cupy.ndarray`
         null FCs in MNI masked voxels.
         Shape (_n_perm, n_voxels)
-    gpu: (bool)
+    gpu: :obj:`bool`
         use GPU for the calculations
 
     Returns
     -------
-    tfce_pvals: (np.ndarray)
+    tfce_pvals: :obj:`np.ndarray`
         p-values of TFCE correction.
         Shape (x, y, z)
-    true_z: (np.ndarray)
+    true_z: :obj:`np.ndarray`
         true (observed) Z map.
         Shape (x, y, z)
-    true_tfce: (np.ndarray)
+    true_tfce: :obj:`np.ndarray`
         true (observed) TFCE map.
         Shape (x, y, z)
-    null_max_tfce: (np.ndarray)
+    null_max_tfce: :obj:`np.ndarray`
         null distribution of maximum absolute TFCE values.
         Shape (n_perm,)
     """
     print("Running TFCE correction...")
+    if gpu:
+        if not has_cupy:
+            raise ImportError(
+                "cupy is required for this function. "
+                "Please install cupy to use it."
+            )
+        # convert input arrays to cupy arrays
+        if isinstance(true_fc, np.ndarray):
+            true_fc = cp.asarray(true_fc)
+        if isinstance(null_fcs, np.ndarray):
+            null_fcs = cp.asarray(null_fcs)
+
     # determine total number of permutations
     # calculated, and number of permutations used
     # for voxel-wise Z calculation
     _n_perm = null_fcs.shape[0]
     n_perm = _n_perm - 1
+
     # define connectivity for cluster detection
     conn = scipy.ndimage.generate_binary_structure(3, 1)
     if gpu:
@@ -311,6 +328,7 @@ def corr_tfce(true_fc, null_fcs, gpu=False):
         true_tfce = nilearn.mass_univariate._utils.calculate_tfce(
             true_z_4d, conn, two_sided_test=True
         ).squeeze()
+
     # calculate null Z and TFCEs to calculate 
     # the null distribution of max values
     # TODO: add options to keep null Zs and TFCEs
@@ -342,6 +360,7 @@ def corr_tfce(true_fc, null_fcs, gpu=False):
             null_max_tfce.append(np.nanmax(np.abs(null_tfce)))
     # convert null max TFCE to array
     null_max_tfce = np.array(null_max_tfce)
+
     # calculate p-TFCE (on flattened map of true TFCE, 
     # then reshape it to the original shape)
     tfce_pvals = (
@@ -349,6 +368,171 @@ def corr_tfce(true_fc, null_fcs, gpu=False):
         / (n_perm + 1)
     ).reshape(true_tfce.shape)
     return tfce_pvals, true_z_4d[..., 0], true_tfce, null_max_tfce
+
+def corr_cfwe(true_fc, null_fcs, p_thresh=0.001, gpu=False):
+    """
+    cFWE correction of convergent connectivity mapping
+    based on mass and size of observed clusters compared to null
+
+    Parameters
+    ----------
+    true_fc: :obj:`np.ndarray` or :obj:`cupy.ndarray`
+        true (observed) convergent FC in MNI masked voxels.
+        Shape (n_voxels,)
+    null_fcs: :obj:`np.ndarray` or :obj:`cupy.ndarray`
+        null FCs in MNI masked voxels.
+        Shape (_n_perm, n_voxels)
+    p_thresh: :obj:`float`
+        p-value threshold for cluster detection.
+    gpu: :obj:`bool`
+        use GPU for the calculations
+
+    Returns
+    -------
+    cfwe_pvals: :obj:`dict` of :obj:`np.ndarray`
+        With keys 'mass' and 'size' including
+        cluster-level FWE corrected p-value
+        maps based on cluster mass/size
+        Shape (x, y, z)
+    true_z: :obj:`np.ndarray`
+        true (observed) Z map.
+        Shape (x, y, z)
+    null_dist: :obj:`dict` of :obj:`np.ndarray`
+        With keys 'mass' and 'size' including
+        null distributions of maximum cluster sizes/masses.
+        Shape (n_perm,)
+    """
+    print("Running cFWE correction...")
+
+    if gpu:
+        if not has_cupy:
+            raise ImportError(
+                "cupy is required for this function. "
+                "Please install cupy to use it."
+            )
+        # convert input arrays to cupy arrays
+        if isinstance(true_fc, np.ndarray):
+            true_fc = cp.asarray(true_fc)
+        if isinstance(null_fcs, np.ndarray):
+            null_fcs = cp.asarray(null_fcs)
+
+    # determine total number of permutations
+    # calculated, and number of permutations used
+    # for voxel-wise Z calculation
+    _n_perm = null_fcs.shape[0]
+    n_perm = _n_perm - 1
+
+    # define (absolute value of) z corresponding to p_thresh
+    z_thresh = nimare.transforms.p_to_z(p_thresh, tail="two")    
+    
+    # define connectivity for cluster detection
+    conn = scipy.ndimage.generate_binary_structure(3, 1)
+    if gpu:
+        conn = cp.asarray(conn)
+    # get mask index mapping for faster 1D->3D mapping
+    mask_idx_mapping = utils.get_mask_idx_mapping(io.MASK_ARR)
+    if gpu:
+        mask_idx_mapping = cp.asarray(mask_idx_mapping)
+
+    # calculate null Zs and their corresponding
+    # clusters 
+    null_max_sizes, null_max_masses = [], []
+    for perm_idx in tqdm(range(n_perm)):
+        # create a mask of current nulls which
+        # will be compared to the current permutation
+        # null (as if it is the true FC)
+        # it includes all nulls except the current one
+        if gpu:
+            mask = cp.ones(_n_perm, dtype=bool)
+        else:
+            mask = np.ones(_n_perm, dtype=bool)
+        mask[perm_idx] = False
+        # calculate null Z map
+        null_z = (null_fcs[perm_idx] - null_fcs[mask].mean(axis=0)) / (null_fcs[mask].std(axis=0))
+        # map null Z to 3d and calculate its maximum
+        # cluster size & mass (two sided, i.e. including
+        # both negative and positive clusters)
+        if gpu:
+            null_z_3d = cp.append(null_z, 0)[mask_idx_mapping]
+            null_max_size, null_max_mass = nimare_gpu.utils._calculate_cluster_measures(
+                null_z_3d, z_thresh, conn, tail="two"
+            )
+            # copy from device to host
+            null_max_size = null_max_size.get()
+            null_max_mass = null_max_mass.get()
+        else:
+            null_z_3d = np.append(null_z, 0)[mask_idx_mapping]
+            null_max_size, null_max_mass = nimare.meta.utils._calculate_cluster_measures(
+                null_z_3d, z_thresh, conn, tail="two"
+            )            
+        null_max_sizes.append(null_max_size)
+        null_max_masses.append(null_max_mass)
+    # convert to np array
+    null_dist = {
+        'size': np.array(null_max_sizes),
+        'mass': np.array(null_max_masses)
+    }
+
+    # calculate true (observed) Z map
+    # excluding the last (extra) null FC (to have the same number of
+    # permutations when calculating null Z maps)
+    true_z = (true_fc - null_fcs[:n_perm].mean(axis=0)) / (null_fcs[:n_perm].std(axis=0))
+    # map to 3d
+    true_z_3d = np.append(true_z, 0)[mask_idx_mapping]
+    if isinstance(true_z_3d, cp.ndarray):
+        true_z_3d = true_z_3d.get()
+    # apply z_thresh (two-sided)
+    true_z_3d[np.abs(true_z_3d) <= z_thresh] = 0
+    # copy conn to cpu if needed
+    if isinstance(conn, cp.ndarray):
+        conn = conn.get()
+    
+    # calculate true cluster masses and sizes
+    # in both sides
+    # NOTE: part of this code is based on
+    # nimare.meta.cbma.base.Base.correct_fwe_montecarlo
+    mass_maps = []
+    size_maps = []
+    for sign in [-1, 1]:
+        signed_true_z_3d = true_z_3d * sign
+        labeled_matrix, _ = scipy.ndimage.label(signed_true_z_3d>0, conn)
+        cluster_labels, idx, cluster_sizes = np.unique(
+            labeled_matrix,
+            return_inverse=True,
+            return_counts=True,
+        )
+        assert cluster_labels[0] == 0
+        # calcualte cluster masses, except for first cluster
+        # (background) which should have mass of zero
+        cluster_masses = np.zeros(cluster_labels.shape)
+        for i_val in cluster_labels[1:]:
+            cluster_mass = np.sum(signed_true_z_3d[labeled_matrix == i_val] - z_thresh)
+            cluster_masses[i_val] = cluster_mass
+        # project cluster masses to voxels in the image volume
+        # (i.e., each voxel's value will be the mass of the cluster
+        # it belongs to, if any)
+        mass_maps.append(cluster_masses[np.reshape(idx, labeled_matrix.shape)])
+        # set background's cluster size to 0
+        cluster_sizes[0] = 0  
+        # project to voxels
+        size_maps.append(cluster_sizes[np.reshape(idx, labeled_matrix.shape)])
+    # get union of + and - clusters
+    # (note that by definition there should be no overlap between the +
+    # and - clusters, therefore maximum and sum have the same behavior)
+    true_cluster_maps = {
+        'mass': np.maximum(*mass_maps),
+        'size': np.maximum(*size_maps)
+    }
+    # calculate pcFWEs (on flattened map of cluster sizes/masses, 
+    # then reshape it to the original shape)
+    cfwe_pvals = {}
+    for measure, true_map in true_cluster_maps.items():
+        cfwe_pvals[measure] = (
+            ((null_dist[measure] >= np.abs(true_cluster_maps[measure]).flatten()[:, None]).sum(axis=1) + 1)
+            / (n_perm + 1)
+        ).reshape(true_cluster_maps[measure].shape)
+    
+    return cfwe_pvals, true_z_3d, null_dist
 
 def ccm_yeo(true_fc, null_fcs, z_from_p=False, fdr=True, plot='bar', ax=None):
     """
