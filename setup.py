@@ -10,15 +10,5 @@ setup(
     author_email='amnsbr@gmail.com',
     url='https://github.com/amnsbr/ccm_tool',
     packages=find_packages(),
-    install_requires=[
-        'numpy',
-        'scipy',
-        'pandas',
-        'NiMARE',
-        'nilearn',
-        'boto3',
-        'tqdm',
-        'seaborn',
-        'statsmodels',
-    ],
+    # Dependencies live in `pyproject.toml` under `[project].dependencies` for `uv` support.
 )

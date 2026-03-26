@@ -2,6 +2,21 @@
 requires = ["setuptools", "versioneer[toml]"]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "ccm_tool"
+dynamic = ["version"]
+dependencies = [
+  "numpy",
+  "scipy",
+  "pandas",
+  "NiMARE",
+  "nilearn",
+  "boto3",
+  "tqdm",
+  "seaborn",
+  "statsmodels",
+]
+
 [tool.versioneer]
 VCS = "git"
 style = "pep440"
